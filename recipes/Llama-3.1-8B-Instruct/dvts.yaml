@@ -1,0 +1,6 @@
+approach: dvts
+n: 128
+search_batch_size: 25
+seed: 96
+model_path: meta-llama/Llama-3.1-8B-Instruct
+prm_path: "Qwen/Qwen2.5-Math-PRM-7B"

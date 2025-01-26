@@ -7,3 +7,4 @@ dataset_start: 0
 dataset_end: 500
 seed: 96
 prm_path: "Qwen/Qwen2.5-Math-PRM-7B"
+model_path: "Qwen/Qwen2.5-Math-1.5B-Instruct"

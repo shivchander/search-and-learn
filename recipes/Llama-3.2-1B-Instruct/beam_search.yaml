@@ -2,7 +2,8 @@
 
 filter_duplicates: true
 approach: beam_search
-n: 4
-search_batch_size: 1  # DO NOT CHANGE!
-num_samples: 10       # REMOVE THIS LINE TO RUN ON THE WHOLE DATASET
-seed: 0
+n: 128
+search_batch_size: 1
+dataset_start: 0
+dataset_end: 500
+seed: 96
