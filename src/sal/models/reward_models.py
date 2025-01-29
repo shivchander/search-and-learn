@@ -27,6 +27,8 @@ from transformers import (
 from sal.config import Config
 import torch.nn.functional as F
 import re
+from vllm import LLM
+import math
 
 CANDIDATE_TOKENS = [648, 387]
 STEP_TAG_ID = 12902
@@ -85,47 +87,134 @@ class PRM:
         raise NotImplementedError
 
 
-class QWEN_PRM(PRM):
+class INTERMLM_ORM(PRM):
     def __init__(self, search_config: Config, **model_kwargs):
-        super().__init__(search_config, **model_kwargs)
+        # super().__init__(search_config, **model_kwargs)
         self.model, self.tokenizer = self.load_model_and_tokenizer()
 
     def load_model_and_tokenizer(self) -> tuple[PreTrainedModel, PreTrainedTokenizer]:
-        model_name = "Qwen/Qwen2.5-Math-PRM-7B"
+        model_name = "internlm/internlm2-7b-reward"
         model = AutoModel.from_pretrained(model_name,
-                                        device_map="auto",
                                         torch_dtype=torch.bfloat16,
+                                        device_map="cuda", 
                                         trust_remote_code=True).eval()
-        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
         return model, tokenizer
-    
-    def score(
-        self, questions: list[str], outputs: list[list[str]], outputs_is_single_step: bool = True
-    ) -> list[list[float]]:
-        '''
-        Score a batch of questions and their step-by-step outputs using PRIME scoring.
-        questions: list of questions
-        outputs: list of lists of N responses, where N answers correspond to 1 question. 
-        '''
-        # define a helper function. 
-        def make_step_rewards(logits, token_masks):
-            probabilities = F.softmax(logits, dim=-1)
-            probabilities = probabilities * token_masks.unsqueeze(-1) # bs, seq_len, num_labels
-            
-            all_scores_res = []
-            for i in range(probabilities.size(0)):
-                sample = probabilities[i] # seq_len, num_labels
-                positive_probs = sample[sample != 0].view(-1, 2)[:, 1] # valid_tokens, num_labels
-                non_zero_elements_list = positive_probs.cpu().tolist()
-                all_scores_res.append(non_zero_elements_list)
-            return all_scores_res
 
-        # TODO: implement QWEN-PRM scoring
+    def score(
+        self, questions: list[str], outputs: list[list[str]], **kwargs
+    ) -> list[list[float]]:
         all_scores = []
         for question, answers in zip(questions, outputs, strict=True):
             all_step_scores = []
             for ans in answers:
-                single_step_score = []
+                messages = [
+                    {"role": "user", "content": question},
+                    {"role": "assistant", "content": ans},
+                ]
+                reward_score = self.model.get_score(self.tokenizer, messages)
+                steps_scores = [reward_score]
+                all_step_scores.append(steps_scores)
+            all_scores.append(all_step_scores)
+        return all_scores
+
+
+class QWEN_ORM(PRM):
+    def __init__(self, search_config: Config, **model_kwargs):
+        # super().__init__(search_config, **model_kwargs)
+        self.model, self.tokenizer = self.load_model_and_tokenizer()
+
+    def load_model_and_tokenizer(self) -> tuple[PreTrainedModel, PreTrainedTokenizer]:
+        model_name = "Qwen/Qwen2.5-Math-RM-72B"
+        model = AutoModel.from_pretrained(model_name,
+                                        device_map="auto",
+                                        torch_dtype=torch.bfloat16,
+                                        trust_remote_code=True).eval()
+        tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+        tokenizer.truncation_side = "left" 
+        return model, tokenizer
+    
+    # implement score to not error out when passed additional arguments
+    def score(
+        self, questions: list[str], outputs: list[list[str]], max_token_length: int = 4096, **kwargs
+    ) -> list[list[float]]:
+        all_scores = []
+        for question, answers in zip(questions, outputs, strict=True):
+            all_step_scores = []
+            for ans in answers:
+                QWEN_PRM_SYSTEM_PROMPT = "Please reason step by step, and put your final answer within \\boxed{}."
+                message = [
+                    {"role": "system", "content": QWEN_PRM_SYSTEM_PROMPT},
+                    {"role": "user", "content": question},
+                    {"role": "assistant", "content": ans},
+                ]
+                conversation_str = self.tokenizer.apply_chat_template(
+                    message, 
+                    tokenize=False, 
+                    add_generation_prompt=False
+                )
+
+                input_ids = self.tokenizer(
+                    conversation_str, 
+                    return_tensors="pt",
+                    add_special_tokens=False, 
+                    truncation=True, 
+                    max_length=max_token_length
+                ).input_ids.to(self.model.device)
+                raw_outputs = self.model(input_ids=input_ids)
+                reward_scores = [raw_outputs[0].item()]
+                all_step_scores.append(reward_scores)
+            all_scores.append(all_step_scores)
+        return all_scores
+
+
+class QWEN_PRM(PRM):
+    def __init__(self, search_config: Config, **model_kwargs):
+        # super().__init__(search_config, **model_kwargs)
+        self.model, self.tokenizer = self.load_model_and_tokenizer(search_config.prm_path)
+
+    def load_model_and_tokenizer(self, model_name: str = None) -> tuple[PreTrainedModel, PreTrainedTokenizer]:
+        import os
+        os.environ["VLLM_ALLOW_LONG_MAX_MODEL_LEN"] = "1"
+        num_gpus = torch.cuda.device_count()
+        print(f"Number of GPUs: {num_gpus}")
+        if model_name == "Qwen/Qwen2.5-Math-PRM-7B":
+            model = LLM(model=model_name, 
+                        task="reward",
+                        device=1,
+                        gpu_memory_utilization=0.85,
+                        tensor_parallel_size=1,
+                        )
+        else:
+            model = LLM(model=model_name, 
+                        task="reward",
+                        gpu_memory_utilization=0.7,
+                        tensor_parallel_size=num_gpus,
+                        )
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        tokenizer.truncation_side = "left"
+        return model, tokenizer
+
+    def score(
+        self, questions: list[str], outputs: list[list[str]], outputs_is_single_step: bool = False,
+        aggregate_method: str = "model_aggregate", max_token_length=4096, **kwargs
+    ) -> list[list[float]]:
+        '''
+        Score a batch of questions and their step-by-step outputs using PRIME scoring.
+        questions: list of questions
+        outputs: list of lists of N responses, where N answers correspond to 1 question.
+        aggregate_method: "product", "lowest", "last", "model_aggregate"
+        '''
+        if aggregate_method == "model_aggregate":
+            outputs_is_single_step = True
+        else:
+            outputs_is_single_step = False
+        # TODO: implement QWEN-PRM scoring
+        all_scores = []
+        for question, answers in zip(questions, outputs, strict=True):
+            all_step_scores = []
+            conversation_strs = []
+            for ans in answers:
                 # we assume here that the answers use "\n\n" to separate steps. 
                 if outputs_is_single_step:
                     ans = re.sub(r'\n+', '\n', ans)
@@ -136,7 +225,7 @@ class QWEN_PRM(PRM):
                     {"role": "system", "content": QWEN_PRM_SYSTEM_PROMPT},
                     {"role": "user", "content": question},
                     {"role": "assistant", "content": "<extra_0>".join(steps_list) + "<extra_0>"},
-                ]
+                ] # 0.88671875
 
                 # Prepare conversation for scoring
                 conversation = self.tokenizer.apply_chat_template(
@@ -144,34 +233,43 @@ class QWEN_PRM(PRM):
                     tokenize=False, 
                     add_generation_prompt=False
                 )
+                conversation_strs.append(conversation)
 
-                input_ids = self.tokenizer.encode(
-                    conversation, 
-                    return_tensors="pt", 
-                ).to(self.model.device)
+            input_ids = self.tokenizer(
+                conversation_strs, 
+                return_tensors="pt",
+                truncation=True, 
+                padding=True,  # Add padding
+                max_length=max_token_length
+            ).input_ids
+            decoded_prompts = self.tokenizer.batch_decode(input_ids, skip_special_tokens=False)
+            outputs = self.model.encode(decoded_prompts)
 
-                outputs = self.model(input_ids=input_ids)
+            # out_scores = [outputs[0].outputs.data[0][-1].item()]
+            out_scores = [[d[-1].item() for d in ex.outputs.data] for ex in outputs]
 
-                # get the step scores
-                step_sep_id = self.tokenizer.encode("<extra_0>")[0]
-                token_masks = (input_ids == step_sep_id)
-                step_scores = make_step_rewards(outputs[0], token_masks)
-
+            for step_scores in out_scores:
                 # make the scores cumulative through multiplication
-                # step_scores = [math.prod(step_scores[:i+1]) for i in range(len(step_scores))]
+                if aggregate_method == "product":
+                    step_scores = [math.prod(step_scores[:i+1]) for i in range(len(step_scores))]
+                elif aggregate_method == "lowest":
+                    step_scores = [min(step_scores)]
+                elif aggregate_method == "last":
+                    step_scores = [step_scores[-1]]
+                elif aggregate_method == "model_aggregate":
+                    pass
+                else:
+                    raise ValueError(f"Invalid aggregate method: {aggregate_method}")
 
-                all_step_scores.extend(step_scores)
-
+                all_step_scores.append(step_scores)
             all_scores.append(all_step_scores)
-
         return all_scores
-
 
 
 class PRIME(PRM):
     def __init__(self, search_config: Config, **model_kwargs):
         # override original init, because we need to load two models and a tokenizer
-        super().__init__(search_config, **model_kwargs)
+        # super().__init__(search_config, **model_kwargs)
         self.model, self.ref_model, self.tokenizer = self.load_model_and_tokenizer()
 
 
@@ -198,7 +296,7 @@ class PRIME(PRM):
         return model, ref_model, tokenizer
     
     def score(
-        self, questions: list[str], outputs: list[list[str]]
+        self, questions: list[str], outputs: list[list[str]], **kwargs
     ) -> list[list[float]]:
         '''
         Score a batch of questions and their step-by-step outputs using PRIME scoring.
@@ -291,10 +389,6 @@ class PRIME(PRM):
         return all_scores
 
 
-
-
-
-
 class MathShepherd(PRM):
     def load_model_and_tokenizer(self) -> tuple[PreTrainedModel, PreTrainedTokenizer]:
         model_id = "peiyi9979/math-shepherd-mistral-7b-prm"
@@ -310,7 +404,7 @@ class MathShepherd(PRM):
         return model, tokenizer
 
     def score(
-        self, questions: list[str], outputs: list[list[str]]
+        self, questions: list[str], outputs: list[list[str]], **kwargs
     ) -> list[list[float]]:
         inputs_for_prm = []
         lengths = []
@@ -375,6 +469,7 @@ class RLHFFlow(PRM):
         outputs: list[list[str]],
         batched: bool = True,
         batch_size=8,
+        **kwargs,
     ) -> list[list[float]]:
         if batched is True:
             return self._score_batched(questions, outputs, batch_size=batch_size)
@@ -421,7 +516,7 @@ class RLHFFlow(PRM):
         return all_scores
 
     def _score_batched(
-        self, questions: list[str], outputs: list[list[str]], batch_size: int = 2
+        self, questions: list[str], outputs: list[list[str]], batch_size: int = 2, **kwargs
     ):
         # The RLHFlow models are trained to predict the "+" or "-" tokens in a dialogue, but since these are not unique
         # we need to introduce a dummy special token here for masking.
@@ -496,9 +591,27 @@ def load_prm(config: Config) -> PRM:
     if config.prm_path == "PRIME-RL/EurusPRM-Stage2":
         return PRIME(config)
 
-    if config.prm_path == "Qwen/Qwen2.5-Math-PRM-7B":
+    if config.prm_path == "Qwen/Qwen2.5-Math-PRM-7B" or config.prm_path == "Qwen/Qwen2.5-Math-PRM-72B":
         return QWEN_PRM(config)
-
+    
+    if config.prm_path == "internlm/internlm2-7b-reward":
+        return INTERMLM_ORM(config)
+    
+    if config.prm_path == "Qwen/Qwen2.5-Math-RM-72B":
+        return QWEN_ORM(config)
     raise NotImplementedError(f"PRM {config.prm_path} not implemented")
 
 
+if __name__ == "__main__":
+    # write a test for the INTERMLM_ORM model
+    # config = Config(prm_path="internlm/internlm2-7b-reward")
+    config = Config(prm_path="Qwen/Qwen2.5-Math-PRM-7B")
+    prm = load_prm(config)
+    questions = ["Hello! What's your name?"]
+    outputs = [["My name is InternLM2!\n\n A helpful AI assistant.\n\n What can I do for you?", "My name is Llama3.1!\n\n A helpful AI shit.\n\n uy good?"],
+               ]
+    # [0.76171875, 0.96484375, 0.99609375]
+    # [0.765625]
+    scores = prm.score(questions, outputs)
+    print(scores)
+    breakpoint()
