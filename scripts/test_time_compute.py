@@ -46,32 +46,26 @@ def main():
 
     dataset = get_dataset(config)
 
-    save_steps = 25
-    splits = [dataset.select(range(i, i+save_steps)) for i in range(0, len(dataset), save_steps)]
-
-    num_gpus = 4 if "qwen2" in config.model_path.lower() else torch.cuda.device_count()
     llm = LLM(
         model=config.model_path,
         gpu_memory_utilization=config.gpu_memory_utilization,
         enable_prefix_caching=True,
         seed=config.seed,
-        tensor_parallel_size=num_gpus,
+        tensor_parallel_size=1,
+        device=0,
     )
     prm = load_prm(config)
 
-    for i, dataset in enumerate(splits):
-        print("--------"*20)
-        print("Processing batch:", i)
-        dataset = dataset.map(
-            approach_fn,
-            batched=False,
-            batch_size=1,
-            fn_kwargs={"config": config, "llm": llm, "prm": prm},
-            desc="Running search",
-            load_from_cache_file=False,
-        )
+    dataset = dataset.map(
+        approach_fn,
+        batched=False,
+        batch_size=1,
+        fn_kwargs={"config": config, "llm": llm, "prm": prm},
+        desc="Running search",
+        load_from_cache_file=False,
+    )
         
-        dataset.to_json(f"{config.output_dir}/batch_{i}.jsonl", orient="records", lines=True)
+    dataset.to_json(f"{config.output_dir}/batch_{i}.jsonl", orient="records", lines=True)
     # save_dataset(dataset, config)
     logger.info("Done 🔥!")
 

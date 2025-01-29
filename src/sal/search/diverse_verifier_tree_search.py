@@ -112,6 +112,8 @@ def _dvts(batch_of_prompts: list[str], config: Config, llm: LLM, prm: PRM):
             prompts.append(beam.prompt)
             completions.append([beam.current_text + t for t in beam.lookahead_texts])
 
+        logger.info(f"Done generating {len(prompts)} prompts")
+        logger.info(f"Scoring {len(prompts)} prompts")
         # scoring and chose best generation per beam TODO: add option for selection across beams within the same prompt
 
         all_scores = prm.score(prompts, completions)
@@ -131,6 +133,7 @@ def _dvts(batch_of_prompts: list[str], config: Config, llm: LLM, prm: PRM):
                 # stopped on EOS, prune
                 beam.pruned = True
 
+        logger.info(f"Done scoring {len(gen_beams)} beams")
         # filter / prune
         for beam in gen_beams:
             if "boxed{" in beam.current_text:
