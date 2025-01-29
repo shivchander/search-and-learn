@@ -63,6 +63,9 @@ def _dvts(batch_of_prompts: list[str], config: Config, llm: LLM, prm: PRM):
 
     for i in tqdm(range(config.num_iterations), desc="Beam search iterations"):
         # generation
+        logger.info(f"Generating {i}")
+        logger.info(f"Num iterations: {config.num_iterations}")
+
         gen_beams = [b for b in beams if not b.pruned]
         if len(gen_beams) == 0:
             break
